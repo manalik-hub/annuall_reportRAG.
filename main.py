@@ -1,0 +1,242 @@
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
+from groq import Groq
+
+import numpy as np
+import re
+import os
+import pickle
+from sklearn.preprocessing import normalize
+
+# =========================
+# 🚀 APP INIT
+# =========================
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =========================
+# 🔐 GROQ (PUT YOUR KEY)
+# =========================
+client = Groq(api_key="YOUR API KEY ")
+
+# =========================
+# 🌍 GLOBALS
+# =========================
+chunks = []
+chunk_texts = []
+embeddings = None
+bm25 = None
+
+# =========================
+# 🤖 MODELS
+# =========================
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# =========================
+# 🔧 HELPERS
+# =========================
+def clean_text(text):
+    text = text.replace("\n", " ")
+    return re.sub(r"\s+", " ", text)
+
+def tokenize(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9.%₹$]", " ", text)
+    return text.split()
+
+def normalize_question(q):
+    return q.lower().replace("₹", "rupees")
+
+# 🎯 detect question type
+def detect_keywords(q):
+    keywords = []
+    if "revenue" in q:
+        keywords += ["revenue", "sales", "income"]
+    if "ebitda" in q:
+        keywords += ["ebitda"]
+    if "profit" in q:
+        keywords += ["profit", "net profit"]
+    return keywords
+
+# =========================
+# 🤖 GROQ ANSWER
+# =========================
+def generate_answer(question, context):
+    prompt = f"""
+You are a financial analyst.
+
+Rules:
+- Find the value relevant to the question
+- Focus on correct label (like revenue, income, etc.)
+- If multiple values exist, choose the correct row
+- DO NOT guess
+- Return ONLY final answer with unit
+
+Question:
+{question}
+
+Context:
+{context}
+"""
+
+    response = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[
+            {"role": "system", "content": "Extract correct financial value."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        max_tokens=100
+    )
+
+    return response.choices[0].message.content.strip()
+
+# =========================
+# 📤 UPLOAD
+# =========================
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    global chunks, chunk_texts, embeddings, bm25
+
+    try:
+        file_path = "temp.pdf"
+        cache_path = f"cache_{file.filename}.pkl"
+
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
+
+        # ⚡ CACHE
+        if os.path.exists(cache_path):
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
+
+            chunks = data["chunks"]
+            chunk_texts = data["chunk_texts"]
+            embeddings = data["embeddings"]
+            bm25 = data["bm25"]
+
+            return {"message": "Loaded from cache ⚡", "chunks": len(chunks)}
+
+        loader = PyPDFLoader(file_path)
+        documents = loader.load()
+
+        documents = documents[:50]
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=100
+        )
+
+        chunks = splitter.split_documents(documents)
+        chunk_texts = [clean_text(c.page_content) for c in chunks]
+
+        embeddings = normalize(np.array(embedder.encode(chunk_texts)))
+
+        tokenized = [tokenize(t) for t in chunk_texts]
+        bm25 = BM25Okapi(tokenized)
+
+        with open(cache_path, "wb") as f:
+            pickle.dump({
+                "chunks": chunks,
+                "chunk_texts": chunk_texts,
+                "embeddings": embeddings,
+                "bm25": bm25
+            }, f)
+
+        return {"message": "Processed & cached ✅", "chunks": len(chunks)}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+# =========================
+# ❓ QUERY MODEL
+# =========================
+class Query(BaseModel):
+    question: str
+
+# =========================
+# ❓ ASK
+# =========================
+@app.post("/ask")
+def ask_question(query: Query):
+    global chunks, chunk_texts, embeddings, bm25
+
+    try:
+        if embeddings is None:
+            return {"error": "Upload PDF first"}
+
+        q = normalize_question(query.question)
+        keywords = detect_keywords(q)
+
+        # 🔍 VECTOR SEARCH
+        q_emb = normalize(np.array(embedder.encode([q])))
+        scores = np.dot(embeddings, q_emb.T).squeeze()
+        top_vec = np.argsort(scores)[-10:][::-1]
+
+        # 🔍 BM25
+        bm25_scores = bm25.get_scores(tokenize(q))
+        top_bm25 = np.argsort(bm25_scores)[-10:][::-1]
+
+        combined = list(set(top_vec) | set(top_bm25))
+
+        # 🔁 RERANK
+        pairs = [(q, chunk_texts[i]) for i in combined]
+        rerank_scores = reranker.predict(pairs)
+
+        scored = list(zip(combined, rerank_scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # ✅ FILTER chunks by keyword relevance
+        filtered = []
+        for idx, _ in scored:
+            text = chunk_texts[idx].lower()
+
+            if any(k in text for k in keywords):
+                filtered.append(idx)
+
+            if len(filtered) == 3:
+                break
+
+        # fallback if nothing matched
+        if not filtered:
+            filtered = [idx for idx, _ in scored[:3]]
+
+        top_chunks = filtered
+
+        # 📚 CONTEXT
+        context = "\n\n".join([chunk_texts[i] for i in top_chunks])
+
+        # 🤖 ANSWER
+        answer = generate_answer(q, context)
+
+        # fallback if bad answer
+        if answer == "NOT FOUND" or len(answer) > 50:
+            answer = context[:100]
+
+        # 📄 SOURCES
+        sources = [
+            {
+                "page": chunks[i].metadata.get("page", "unknown"),
+                "text": chunk_texts[i][:200]
+            }
+            for i in top_chunks
+        ]
+
+        return {"answer": answer, "sources": sources}
+
+    except Exception as e:
+        return {"error": str(e)} 
