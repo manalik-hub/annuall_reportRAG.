@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sentence-transformers
+langchain-community
+rank-bm25
+groq
+scikit-learn
+numpy
+pypdf
