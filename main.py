@@ -13,6 +13,11 @@ import re
 import os
 import pickle
 from sklearn.preprocessing import normalize
+from fastapi.responses import FileResponse
+
+@app.get("/")
+def serve_ui():
+    return FileResponse("index.html")
 
 # =========================
 # 🚀 APP INIT
@@ -20,7 +25,7 @@ from sklearn.preprocessing import normalize
 app = FastAPI()
 
 # ✅ Serve UI
-app.mount("/", StaticFiles(directory=".", html=True), name="static")
+app.mount("/static", StaticFiles(directory=".", html=True), name="static")
 
 app.add_middleware(
     CORSMiddleware,
