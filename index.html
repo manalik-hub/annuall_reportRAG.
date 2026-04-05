@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RAG </title>
+<title>RAG App</title>
 
 <style>
 body {
@@ -87,7 +87,7 @@ button {
 <body>
 
 <div class="container">
-    <h1> ASK ME ANYTHING </h1>
+    <h1>ASK ME ANYTHING</h1>
 
     <!-- Upload -->
     <div class="upload-box" onclick="document.getElementById('fileInput').click()">
@@ -102,28 +102,38 @@ button {
 
     <!-- Input -->
     <div class="input-area">
-        <input type="text" id="question" placeholder="Ask something..." />
+        <input type="text" id="question" placeholder="Ask something..." disabled />
         <button onclick="askQuestion()">Send</button>
     </div>
 </div>
 
 <script>
+
+// 🔥 YOUR LIVE BACKEND URL
+const API = "https://annuall-reportrag-5.onrender.com";
+
 let ready = false;
+
+// Elements
+const fileInput = document.getElementById("fileInput");
+const questionInput = document.getElementById("question");
+const chatBox = document.getElementById("chatBox");
+const status = document.getElementById("status");
 
 // =========================
 // 📤 UPLOAD PDF
 // =========================
-document.getElementById("fileInput").onchange = async () => {
-    const file = document.getElementById("fileInput").files[0];
+fileInput.onchange = async () => {
+    const file = fileInput.files[0];
     if (!file) return;
 
     const formData = new FormData();
     formData.append("file", file);
 
-    document.getElementById("status").innerText = "Uploading PDF... ⏳";
+    status.innerText = "Uploading PDF... ⏳";
 
     try {
-        const res = await fetch("http://127.0.0.1:8000/upload", {
+        const res = await fetch(`${API}/upload`, {
             method: "POST",
             body: formData
         });
@@ -135,15 +145,13 @@ document.getElementById("fileInput").onchange = async () => {
             throw new Error(data.error || "Upload failed");
         }
 
-        document.getElementById("status").innerText =
-            `✅ PDF uploaded (${data.chunks} chunks)`;
-
+        status.innerText = `✅ PDF uploaded (${data.chunks} chunks)`;
         ready = true;
+        questionInput.disabled = false;
 
     } catch (err) {
         console.error(err);
-        document.getElementById("status").innerText =
-            "❌ Upload failed: " + err.message;
+        status.innerText = "❌ Upload failed: " + err.message;
     }
 };
 
@@ -151,45 +159,58 @@ document.getElementById("fileInput").onchange = async () => {
 // ❓ ASK QUESTION
 // =========================
 async function askQuestion() {
-    const questionInput = document.getElementById("question");
-    const chatBox = document.getElementById("chatBox");
-
     const question = questionInput.value.trim();
     if (!question) return;
 
     if (!ready) {
-        alert("Upload PDF first!");
+        alert("⚠️ Upload PDF first!");
         return;
     }
 
     // Show user message
-    chatBox.innerHTML += `<div class="message user">You: ${question}</div>`;
+    chatBox.innerHTML += `
+        <div class="message user">
+            You: ${question}
+        </div>
+    `;
     questionInput.value = "";
 
+    // Show loading
+    const loadingMsg = document.createElement("div");
+    loadingMsg.className = "message bot";
+    loadingMsg.innerText = "Thinking... 🤖";
+    chatBox.appendChild(loadingMsg);
+    chatBox.scrollTop = chatBox.scrollHeight;
+
     try {
-        const res = await fetch("http://127.0.0.1:8000/ask", {
+        const res = await fetch(`${API}/ask`, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ question })
         });
 
         const data = await res.json();
         console.log(data);
 
-        if (data.error) {
-            throw new Error(data.error);
+        if (!res.ok || data.error) {
+            throw new Error(data.error || "Error getting answer");
+        }
+
+        // Remove loading
+        loadingMsg.remove();
+
+        // Format sources
+        let sourcesHTML = "";
+        if (data.sources && data.sources.length > 0) {
+            sourcesHTML = data.sources.map(s =>
+                `📄 Page ${s.page}: ${s.text}...`
+            ).join("<br>");
         }
 
         // Show answer
-        let sourcesHTML = data.sources.map(s =>
-            `Page ${s.page}: ${s.text}...`
-        ).join("<br>");
-
         chatBox.innerHTML += `
             <div class="message bot">
-                Answer: ${data.answer} <br><br>
+                <b>Answer:</b> ${data.answer} <br><br>
                 <small>${sourcesHTML}</small>
             </div>
         `;
@@ -198,9 +219,25 @@ async function askQuestion() {
 
     } catch (err) {
         console.error(err);
-        chatBox.innerHTML += `<div class="message bot">❌ Error: ${err.message}</div>`;
+        loadingMsg.remove();
+
+        chatBox.innerHTML += `
+            <div class="message bot">
+                ❌ Error: ${err.message}
+            </div>
+        `;
     }
 }
+
+// =========================
+// Enter key support
+// =========================
+questionInput.addEventListener("keyup", function(e) {
+    if (e.key === "Enter") {
+        askQuestion();
+    }
+});
+
 </script>
 
 </body>
