@@ -9,3 +9,4 @@ langchain-community
 rank-bm25
 groq
 pydantic
+python-multipart
