@@ -28,7 +28,7 @@ app.add_middleware(
 )
 
 # =========================
-# 🔐 GROQ (PUT YOUR KEY)
+# 🔐 GROQ (ENV VARIABLE)
 # =========================
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
@@ -40,11 +40,23 @@ chunk_texts = []
 embeddings = None
 bm25 = None
 
+# 🔥 LAZY LOADED MODELS
+embedder = None
+reranker = None
+
 # =========================
-# 🤖 MODELS
+# 🧠 LOAD MODELS (LAZY)
 # =========================
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+def load_models():
+    global embedder, reranker
+
+    if embedder is None:
+        print("Loading embedder...")
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+    if reranker is None:
+        print("Loading reranker...")
+        reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # =========================
 # 🔧 HELPERS
@@ -61,7 +73,6 @@ def tokenize(text):
 def normalize_question(q):
     return q.lower().replace("₹", "rupees")
 
-# 🎯 detect question type
 def detect_keywords(q):
     keywords = []
     if "revenue" in q:
@@ -113,13 +124,14 @@ async def upload_pdf(file: UploadFile = File(...)):
     global chunks, chunk_texts, embeddings, bm25
 
     try:
+        load_models()  # 🔥 IMPORTANT
+
         file_path = "temp.pdf"
         cache_path = f"cache_{file.filename}.pkl"
 
         with open(file_path, "wb") as f:
             f.write(await file.read())
 
-        # ⚡ CACHE
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 data = pickle.load(f)
@@ -133,7 +145,6 @@ async def upload_pdf(file: UploadFile = File(...)):
 
         loader = PyPDFLoader(file_path)
         documents = loader.load()
-
         documents = documents[:50]
 
         splitter = RecursiveCharacterTextSplitter(
@@ -176,31 +187,29 @@ def ask_question(query: Query):
     global chunks, chunk_texts, embeddings, bm25
 
     try:
+        load_models()  # 🔥 IMPORTANT
+
         if embeddings is None:
             return {"error": "Upload PDF first"}
 
         q = normalize_question(query.question)
         keywords = detect_keywords(q)
 
-        # 🔍 VECTOR SEARCH
         q_emb = normalize(np.array(embedder.encode([q])))
         scores = np.dot(embeddings, q_emb.T).squeeze()
         top_vec = np.argsort(scores)[-10:][::-1]
 
-        # 🔍 BM25
         bm25_scores = bm25.get_scores(tokenize(q))
         top_bm25 = np.argsort(bm25_scores)[-10:][::-1]
 
         combined = list(set(top_vec) | set(top_bm25))
 
-        # 🔁 RERANK
         pairs = [(q, chunk_texts[i]) for i in combined]
         rerank_scores = reranker.predict(pairs)
 
         scored = list(zip(combined, rerank_scores))
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        # ✅ FILTER chunks by keyword relevance
         filtered = []
         for idx, _ in scored:
             text = chunk_texts[idx].lower()
@@ -211,32 +220,24 @@ def ask_question(query: Query):
             if len(filtered) == 3:
                 break
 
-        # fallback if nothing matched
         if not filtered:
             filtered = [idx for idx, _ in scored[:3]]
 
-        top_chunks = filtered
-
-        # 📚 CONTEXT
-        context = "\n\n".join([chunk_texts[i] for i in top_chunks])
-
-        # 🤖 ANSWER
+        context = "\n\n".join([chunk_texts[i] for i in filtered])
         answer = generate_answer(q, context)
 
-        # fallback if bad answer
         if answer == "NOT FOUND" or len(answer) > 50:
             answer = context[:100]
 
-        # 📄 SOURCES
         sources = [
             {
                 "page": chunks[i].metadata.get("page", "unknown"),
                 "text": chunk_texts[i][:200]
             }
-            for i in top_chunks
+            for i in filtered
         ]
 
         return {"answer": answer, "sources": sources}
 
     except Exception as e:
-        return {"error": str(e)} 
+        return {"error": str(e)}
