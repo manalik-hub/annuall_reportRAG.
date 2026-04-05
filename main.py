@@ -6,6 +6,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
+from fastapi.staticfiles import StaticFiles
 from groq import Groq
 
 import numpy as np
@@ -18,9 +19,7 @@ from sklearn.preprocessing import normalize
 # 🚀 APP INIT
 # =========================
 app = FastAPI()
-@app.get("/")
-def serve_ui():
-    return FileResponse("index.html")
+app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,10 +29,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# 🔐 GROQ (ENV VARIABLE)
-# =========================
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+api_key = os.environ.get("GROQ_API_KEY")
+
+if not api_key:
+    raise ValueError("❌ GROQ_API_KEY not set")
+
+client = Groq(api_key=api_key)
 
 # =========================
 # 🌍 GLOBALS
