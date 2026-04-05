@@ -1,3 +1,6 @@
+// 🔥 LIVE API URL
+const API = "https://annuall-reportrag-5.onrender.com";
+
 let ready = false;
 
 // Elements
@@ -22,7 +25,7 @@ fileInput.onchange = async () => {
     status.innerText = "Uploading PDF... ⏳";
 
     try {
-        const res = await fetch("http://127.0.0.1:8000/upload", {
+        const res = await fetch(`${API}/upload`, {
             method: "POST",
             body: formData
         });
@@ -66,13 +69,14 @@ async function askQuestion() {
     questionInput.value = "";
 
     // Show loading
-    chatBox.innerHTML += `
-        <div class="message bot">Thinking... 🤖</div>
-    `;
+    const loadingMsg = document.createElement("div");
+    loadingMsg.className = "message bot";
+    loadingMsg.innerText = "Thinking... 🤖";
+    chatBox.appendChild(loadingMsg);
     chatBox.scrollTop = chatBox.scrollHeight;
 
     try {
-        const res = await fetch("http://127.0.0.1:8000/ask", {
+        const res = await fetch(`${API}/ask`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ question })
@@ -85,31 +89,33 @@ async function askQuestion() {
             throw new Error(data.error || "Error getting answer");
         }
 
-        // Remove "Thinking..." message
-        const botMessages = document.querySelectorAll(".bot");
-        if (botMessages.length) botMessages[botMessages.length - 1].remove();
+        // Remove loading message
+        loadingMsg.remove();
 
-        // ✅ Render final answer + single source
-        let sourceHTML = "";
-        if (data.source) {
-            sourceHTML = `
-                📄 Page ${data.source.page}<br>
-                ${data.source.text}...
-            `;
+        // ✅ Format sources correctly
+        let sourcesHTML = "";
+        if (data.sources && data.sources.length > 0) {
+            sourcesHTML = data.sources.map(s =>
+                `📄 Page ${s.page}: ${s.text}...`
+            ).join("<br>");
         }
 
+        // Show answer
         chatBox.innerHTML += `
             <div class="message bot">
                 <div><b>Answer:</b> ${data.answer}</div>
                 <div style="margin-top:8px; font-size:12px; color:#222;">
-                    ${sourceHTML}
+                    ${sourcesHTML}
                 </div>
             </div>
         `;
+
         chatBox.scrollTop = chatBox.scrollHeight;
 
     } catch (err) {
         console.error(err);
+        loadingMsg.remove();
+
         chatBox.innerHTML += `
             <div class="message bot">
                 ❌ Error: ${err.message}
@@ -120,10 +126,10 @@ async function askQuestion() {
 }
 
 // =========================
-// Press Enter to ask question
+// ⌨️ Enter key support
 // =========================
 questionInput.addEventListener("keyup", function(e) {
     if (e.key === "Enter") {
         askQuestion();
     }
-}); 
+});
