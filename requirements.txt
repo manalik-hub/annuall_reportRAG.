@@ -1,9 +1,11 @@
 fastapi
-uvicorn
+uvicorn[standard]
+gunicorn
+numpy
+scikit-learn
 sentence-transformers
+langchain
 langchain-community
 rank-bm25
 groq
-scikit-learn
-numpy
-pypdf
+pydantic
