@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+from fastapi.responses import FileResponse
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -18,6 +18,9 @@ from sklearn.preprocessing import normalize
 # 🚀 APP INIT
 # =========================
 app = FastAPI()
+@app.get("/")
+def serve_ui():
+    return FileResponse("index.html")
 
 app.add_middleware(
     CORSMiddleware,
