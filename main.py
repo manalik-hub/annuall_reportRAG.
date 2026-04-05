@@ -1,12 +1,11 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from fastapi.staticfiles import StaticFiles
 from groq import Groq
 
 import numpy as np
@@ -19,6 +18,8 @@ from sklearn.preprocessing import normalize
 # 🚀 APP INIT
 # =========================
 app = FastAPI()
+
+# ✅ Serve UI
 app.mount("/", StaticFiles(directory=".", html=True), name="static")
 
 app.add_middleware(
@@ -29,6 +30,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# =========================
+# 🔐 GROQ (ENV VARIABLE)
+# =========================
 api_key = os.environ.get("GROQ_API_KEY")
 
 if not api_key:
@@ -44,23 +48,18 @@ chunk_texts = []
 embeddings = None
 bm25 = None
 
-# 🔥 LAZY LOADED MODELS
+# 🔥 LAZY MODEL
 embedder = None
-reranker = None
 
 # =========================
-# 🧠 LOAD MODELS (LAZY)
+# 🧠 LOAD MODEL
 # =========================
 def load_models():
-    global embedder, reranker
+    global embedder
 
     if embedder is None:
         print("Loading embedder...")
         embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-    if reranker is None:
-        print("Loading reranker...")
-        reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # =========================
 # 🔧 HELPERS
@@ -128,7 +127,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     global chunks, chunk_texts, embeddings, bm25
 
     try:
-        load_models()  # 🔥 IMPORTANT
+        load_models()
 
         file_path = "temp.pdf"
         cache_path = f"cache_{file.filename}.pkl"
@@ -136,6 +135,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         with open(file_path, "wb") as f:
             f.write(await file.read())
 
+        # ✅ CACHE LOAD
         if os.path.exists(cache_path):
             with open(cache_path, "rb") as f:
                 data = pickle.load(f)
@@ -147,6 +147,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
             return {"message": "Loaded from cache ⚡", "chunks": len(chunks)}
 
+        # 📄 LOAD PDF
         loader = PyPDFLoader(file_path)
         documents = loader.load()
         documents = documents[:50]
@@ -159,11 +160,14 @@ async def upload_pdf(file: UploadFile = File(...)):
         chunks = splitter.split_documents(documents)
         chunk_texts = [clean_text(c.page_content) for c in chunks]
 
+        # 🔍 EMBEDDINGS (semantic search)
         embeddings = normalize(np.array(embedder.encode(chunk_texts)))
 
+        # 🔍 BM25
         tokenized = [tokenize(t) for t in chunk_texts]
         bm25 = BM25Okapi(tokenized)
 
+        # 💾 CACHE SAVE
         with open(cache_path, "wb") as f:
             pickle.dump({
                 "chunks": chunks,
@@ -191,7 +195,7 @@ def ask_question(query: Query):
     global chunks, chunk_texts, embeddings, bm25
 
     try:
-        load_models()  # 🔥 IMPORTANT
+        load_models()
 
         if embeddings is None:
             return {"error": "Upload PDF first"}
@@ -199,23 +203,21 @@ def ask_question(query: Query):
         q = normalize_question(query.question)
         keywords = detect_keywords(q)
 
+        # 🔍 SEMANTIC SEARCH
         q_emb = normalize(np.array(embedder.encode([q])))
         scores = np.dot(embeddings, q_emb.T).squeeze()
         top_vec = np.argsort(scores)[-10:][::-1]
 
+        # 🔍 BM25
         bm25_scores = bm25.get_scores(tokenize(q))
         top_bm25 = np.argsort(bm25_scores)[-10:][::-1]
 
+        # 🔗 COMBINE
         combined = list(set(top_vec) | set(top_bm25))
 
-        pairs = [(q, chunk_texts[i]) for i in combined]
-        rerank_scores = reranker.predict(pairs)
-
-        scored = list(zip(combined, rerank_scores))
-        scored.sort(key=lambda x: x[1], reverse=True)
-
+        # ✅ SMART FILTER (replaces reranker)
         filtered = []
-        for idx, _ in scored:
+        for idx in combined:
             text = chunk_texts[idx].lower()
 
             if any(k in text for k in keywords):
@@ -225,14 +227,18 @@ def ask_question(query: Query):
                 break
 
         if not filtered:
-            filtered = [idx for idx, _ in scored[:3]]
+            filtered = combined[:3]
 
+        # 📚 CONTEXT
         context = "\n\n".join([chunk_texts[i] for i in filtered])
+
+        # 🤖 LLM
         answer = generate_answer(q, context)
 
         if answer == "NOT FOUND" or len(answer) > 50:
             answer = context[:100]
 
+        # 📄 SOURCES
         sources = [
             {
                 "page": chunks[i].metadata.get("page", "unknown"),
