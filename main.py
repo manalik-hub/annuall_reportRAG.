@@ -30,7 +30,7 @@ app.add_middleware(
 # =========================
 # 🔐 GROQ (PUT YOUR KEY)
 # =========================
-client = Groq(api_key="YOUR API KEY ")
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # =========================
 # 🌍 GLOBALS
