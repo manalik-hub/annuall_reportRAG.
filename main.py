@@ -14,7 +14,7 @@ import os
 import pickle
 from sklearn.preprocessing import normalize
 from fastapi.responses import FileResponse
-
+app = FastAPI()
 @app.get("/")
 def serve_ui():
     return FileResponse("index.html")
@@ -22,7 +22,7 @@ def serve_ui():
 # =========================
 # 🚀 APP INIT
 # =========================
-app = FastAPI()
+
 
 # ✅ Serve UI
 app.mount("/static", StaticFiles(directory=".", html=True), name="static")
