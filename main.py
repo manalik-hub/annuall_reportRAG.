@@ -1,31 +1,27 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from groq import Groq
 
 import numpy as np
 import re
 import os
-import pickle
 from sklearn.preprocessing import normalize
-from fastapi.responses import FileResponse
-app = FastAPI()
-@app.get("/")
-def serve_ui():
-    return FileResponse("index.html")
 
 # =========================
 # 🚀 APP INIT
 # =========================
+app = FastAPI()
 
-
-# ✅ Serve UI
-app.mount("/static", StaticFiles(directory=".", html=True), name="static")
+@app.get("/")
+def serve_ui():
+    return FileResponse("index.html")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,12 +32,11 @@ app.add_middleware(
 )
 
 # =========================
-# 🔐 GROQ (ENV VARIABLE)
+# 🔐 GROQ
 # =========================
 api_key = os.environ.get("GROQ_API_KEY")
-
 if not api_key:
-    raise ValueError("❌ GROQ_API_KEY not set")
+    raise ValueError("GROQ_API_KEY not set")
 
 client = Groq(api_key=api_key)
 
@@ -53,18 +48,22 @@ chunk_texts = []
 embeddings = None
 bm25 = None
 
-# 🔥 LAZY MODEL
 embedder = None
+reranker = None
 
 # =========================
-# 🧠 LOAD MODEL
+# 🧠 LOAD MODELS (LAZY)
 # =========================
 def load_models():
-    global embedder
+    global embedder, reranker
 
     if embedder is None:
         print("Loading embedder...")
         embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+    if reranker is None:
+        print("Loading reranker...")
+        reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 # =========================
 # 🔧 HELPERS
@@ -81,16 +80,6 @@ def tokenize(text):
 def normalize_question(q):
     return q.lower().replace("₹", "rupees")
 
-def detect_keywords(q):
-    keywords = []
-    if "revenue" in q:
-        keywords += ["revenue", "sales", "income"]
-    if "ebitda" in q:
-        keywords += ["ebitda"]
-    if "profit" in q:
-        keywords += ["profit", "net profit"]
-    return keywords
-
 # =========================
 # 🤖 GROQ ANSWER
 # =========================
@@ -99,11 +88,9 @@ def generate_answer(question, context):
 You are a financial analyst.
 
 Rules:
-- Find the value relevant to the question
-- Focus on correct label (like revenue, income, etc.)
-- If multiple values exist, choose the correct row
-- DO NOT guess
-- Return ONLY final answer with unit
+- Find the exact value asked
+- Do NOT guess
+- Return only final answer with unit
 
 Question:
 {question}
@@ -125,65 +112,47 @@ Context:
     return response.choices[0].message.content.strip()
 
 # =========================
-# 📤 UPLOAD
+# 📤 UPLOAD (LIGHTWEIGHT)
 # =========================
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     global chunks, chunk_texts, embeddings, bm25
 
     try:
-        load_models()
+        contents = await file.read()
 
-        file_path = "temp.pdf"
-        cache_path = f"cache_{file.filename}.pkl"
+        # 🚨 LIMIT FILE SIZE (IMPORTANT)
+        if len(contents) > 3 * 1024 * 1024:
+            return {"error": "File too large (max 3MB)"}
 
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
+        with open("temp.pdf", "wb") as f:
+            f.write(contents)
 
-        # ✅ CACHE LOAD
-        if os.path.exists(cache_path):
-            with open(cache_path, "rb") as f:
-                data = pickle.load(f)
-
-            chunks = data["chunks"]
-            chunk_texts = data["chunk_texts"]
-            embeddings = data["embeddings"]
-            bm25 = data["bm25"]
-
-            return {"message": "Loaded from cache ⚡", "chunks": len(chunks)}
-
-        # 📄 LOAD PDF
-        loader = PyPDFLoader(file_path)
+        loader = PyPDFLoader("temp.pdf")
         documents = loader.load()
-        documents = documents[:50]
+
+        # 🚨 LIMIT PAGES
+        documents = documents[:10]
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100
+            chunk_size=500,
+            chunk_overlap=50
         )
 
         chunks = splitter.split_documents(documents)
         chunk_texts = [clean_text(c.page_content) for c in chunks]
 
-        # 🔍 EMBEDDINGS (semantic search)
-        embeddings = normalize(np.array(embedder.encode(chunk_texts)))
+        # 🔥 RESET embeddings so they regenerate fresh
+        embeddings = None
+        bm25 = None
 
-        # 🔍 BM25
-        tokenized = [tokenize(t) for t in chunk_texts]
-        bm25 = BM25Okapi(tokenized)
-
-        # 💾 CACHE SAVE
-        with open(cache_path, "wb") as f:
-            pickle.dump({
-                "chunks": chunks,
-                "chunk_texts": chunk_texts,
-                "embeddings": embeddings,
-                "bm25": bm25
-            }, f)
-
-        return {"message": "Processed & cached ✅", "chunks": len(chunks)}
+        return {
+            "message": "PDF processed ✅",
+            "chunks": len(chunks)
+        }
 
     except Exception as e:
+        print("UPLOAD ERROR:", str(e))
         return {"error": str(e)}
 
 # =========================
@@ -193,66 +162,63 @@ class Query(BaseModel):
     question: str
 
 # =========================
-# ❓ ASK
+# ❓ ASK (HEAVY WORK HERE)
 # =========================
 @app.post("/ask")
 def ask_question(query: Query):
-    global chunks, chunk_texts, embeddings, bm25
+    global embeddings, bm25
 
     try:
-        load_models()
-
-        if embeddings is None:
+        if not chunk_texts:
             return {"error": "Upload PDF first"}
 
-        q = normalize_question(query.question)
-        keywords = detect_keywords(q)
+        # 🔥 LOAD MODELS HERE ONLY
+        load_models()
 
-        # 🔍 SEMANTIC SEARCH
+        # 🔥 CREATE EMBEDDINGS ONLY ONCE
+        if embeddings is None:
+            print("Creating embeddings...")
+            embeddings = normalize(np.array(embedder.encode(chunk_texts)))
+
+            tokenized = [tokenize(t) for t in chunk_texts]
+            bm25 = BM25Okapi(tokenized)
+
+        q = normalize_question(query.question)
+
+        # 🔍 VECTOR SEARCH
         q_emb = normalize(np.array(embedder.encode([q])))
         scores = np.dot(embeddings, q_emb.T).squeeze()
-        top_vec = np.argsort(scores)[-10:][::-1]
+        top_vec = np.argsort(scores)[-5:][::-1]
 
         # 🔍 BM25
         bm25_scores = bm25.get_scores(tokenize(q))
-        top_bm25 = np.argsort(bm25_scores)[-10:][::-1]
+        top_bm25 = np.argsort(bm25_scores)[-5:][::-1]
 
-        # 🔗 COMBINE
         combined = list(set(top_vec) | set(top_bm25))
 
-        # ✅ SMART FILTER (replaces reranker)
-        filtered = []
-        for idx in combined:
-            text = chunk_texts[idx].lower()
+        # 🔁 RERANK
+        pairs = [(q, chunk_texts[i]) for i in combined]
+        rerank_scores = reranker.predict(pairs)
 
-            if any(k in text for k in keywords):
-                filtered.append(idx)
+        scored = list(zip(combined, rerank_scores))
+        scored.sort(key=lambda x: x[1], reverse=True)
 
-            if len(filtered) == 3:
-                break
+        top_chunks = [idx for idx, _ in scored[:3]]
 
-        if not filtered:
-            filtered = combined[:3]
+        context = "\n\n".join([chunk_texts[i] for i in top_chunks])
 
-        # 📚 CONTEXT
-        context = "\n\n".join([chunk_texts[i] for i in filtered])
-
-        # 🤖 LLM
         answer = generate_answer(q, context)
 
-        if answer == "NOT FOUND" or len(answer) > 50:
-            answer = context[:100]
-
-        # 📄 SOURCES
         sources = [
             {
                 "page": chunks[i].metadata.get("page", "unknown"),
                 "text": chunk_texts[i][:200]
             }
-            for i in filtered
+            for i in top_chunks
         ]
 
         return {"answer": answer, "sources": sources}
 
     except Exception as e:
+        print("ASK ERROR:", str(e))
         return {"error": str(e)}
